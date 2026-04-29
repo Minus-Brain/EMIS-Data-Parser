@@ -1,0 +1,7 @@
+customtkinter
+fpdf2
+openpyxl
+pandas
+python-dotenv
+selenium
+webdriver-manager
