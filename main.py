@@ -245,7 +245,22 @@ class ReportBuilder:
 
         sem1_df, sem1_abs = cls.generate_report_df(df1)
         sem2_df, sem2_abs = cls.generate_report_df(df2)
-        year_df, year_abs = cls.generate_report_df(df)
+        
+        # Calculate Year Final via Semester Finals (sem1_df["Final"] and sem2_df["Final"])
+        if not sem1_df.empty and not sem2_df.empty:
+            # Combine sem1 and sem2 to calculate mean of finals
+            combined = pd.concat([sem1_df["Final"], sem2_df["Final"]], axis=1, keys=["S1", "S2"])
+            year_final = combined.mean(axis=1).apply(cls.custom_round).fillna(0).astype(int)
+            year_abs = sem1_abs + sem2_abs
+            
+            # Form year_df
+            year_df = pd.DataFrame(index=year_final.index)
+            year_df["Count"] = sem1_df.get("Count", pd.Series(dtype=int)).add(sem2_df.get("Count", pd.Series(dtype=int)), fill_value=0)
+            year_df["Average"] = sem1_df.get("Average", pd.Series(dtype=float)).add(sem2_df.get("Average", pd.Series(dtype=float)), fill_value=0) / 2
+            year_df["Final"] = year_final
+            year_df["Absences"] = year_abs
+        else:
+             year_df, year_abs = cls.generate_report_df(df)
 
         sem1_score = cls.calculate_total_final_score(sem1_df)
         sem2_score = cls.calculate_total_final_score(sem2_df)
@@ -402,31 +417,28 @@ class EmisParserEngine:
                 return options
 
             manager_failed = False
-            service = None
+            manager_path = None
             try:
                 manager_path = EdgeChromiumDriverManager().install()
-                service = EdgeService(manager_path)
                 self.logger.log("Edge driver resolved by webdriver-manager")
             except Exception as exc:
                 manager_failed = True
                 self.logger.log(f"webdriver-manager failed for Edge ({exc}). Falling back to Selenium Manager")
 
-            last_error = None
-            for use_profile in (True, False):
-                if not use_profile:
-                    self.logger.log("Retrying browser startup without user profile lock")
-
-                options = build_edge_options(use_profile)
-                try:
-                    if not manager_failed and service:
-                        return webdriver.Edge(service=service, options=options)
-                    else:
-                        return webdriver.Edge(options=options)
-                except WebDriverException as exc:
-                    last_error = exc
-                    continue
-
-            raise last_error if last_error else RuntimeError("Unable to start Edge WebDriver")
+            use_profile = True if (self.config.user_data_path or self.config.profile_directory) else False
+            options = build_edge_options(use_profile)
+            
+            try:
+                if not manager_failed and manager_path:
+                    service = EdgeService(manager_path)
+                    return webdriver.Edge(service=service, options=options)
+                else:
+                    return webdriver.Edge(options=options)
+            except WebDriverException as exc:
+                err_msg = str(exc).lower()
+                if "session not created" in err_msg or "in use" in err_msg or "locked" in err_msg:
+                    raise RuntimeError("Please close your Edge browser first before running the parser. Profile is locked.")
+                raise RuntimeError(f"Unable to start Edge WebDriver: {exc}")
 
         if browser in ("chrome", "brave"):
 
@@ -449,10 +461,9 @@ class EmisParserEngine:
 
             chrome_type = ChromeType.BRAVE if browser == "brave" else ChromeType.GOOGLE
             manager_failed = False
-            service = None
+            manager_path = None
             try:
                 manager_path = ChromeDriverManager(chrome_type=chrome_type).install()
-                service = ChromeService(manager_path)
                 self.logger.log(f"{browser.title()} driver resolved by webdriver-manager")
             except Exception as exc:
                 manager_failed = True
@@ -460,22 +471,20 @@ class EmisParserEngine:
                     f"webdriver-manager failed for {browser} ({exc}). Falling back to Selenium Manager"
                 )
 
-            last_error = None
-            for use_profile in (True, False):
-                if not use_profile:
-                    self.logger.log("Retrying browser startup without user profile lock")
-
-                options = build_chrome_options(use_profile)
-                try:
-                    if not manager_failed and service:
-                        return webdriver.Chrome(service=service, options=options)
-                    else:
-                        return webdriver.Chrome(options=options)
-                except WebDriverException as exc:
-                    last_error = exc
-                    continue
-
-            raise last_error if last_error else RuntimeError(f"Unable to start {browser} WebDriver")
+            use_profile = True if (self.config.user_data_path or self.config.profile_directory) else False
+            options = build_chrome_options(use_profile)
+            
+            try:
+                if not manager_failed and manager_path:
+                    service = ChromeService(manager_path)
+                    return webdriver.Chrome(service=service, options=options)
+                else:
+                    return webdriver.Chrome(options=options)
+            except WebDriverException as exc:
+                err_msg = str(exc).lower()
+                if "session not created" in err_msg or "in use" in err_msg or "locked" in err_msg:
+                    raise RuntimeError(f"Please close your {browser.title()} browser first before running the parser. Profile is locked.")
+                raise RuntimeError(f"Unable to start {browser.title()} WebDriver: {exc}")
 
         raise ValueError(f"Unsupported browser: {browser}")
 
@@ -560,19 +569,11 @@ class EmisParserEngine:
 
     @staticmethod
     def _default_user_profile_path(browser: str) -> str | None:
-        localapp = Path(os.environ.get("LOCALAPPDATA", ""))
-        if not localapp:
-            return None
-
-        profile_map = {
-            "edge": localapp / "Microsoft" / "Edge" / "User Data",
-            "chrome": localapp / "Google" / "Chrome" / "User Data",
-            "brave": localapp / "BraveSoftware" / "Brave-Browser" / "User Data",
-        }
-        path = profile_map.get(browser)
-        if path and path.exists():
-            return str(path)
-        return None
+        # Create an isolated portable profile directory specific to the parser
+        # This prevents locking the main browser windows.
+        path = Path.cwd() / ".emis_browser_profile" / browser
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
 
     @staticmethod
     def _wait_for_week_buttons(driver, timeout=3):
@@ -780,11 +781,22 @@ class EmisGuiApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        # More modern/ergonomic font configuration
-        self.font_title = ctk.CTkFont(family="Segoe UI", size=28, weight="bold")
+        # More modern/premium font and theme configuration
+        self.font_title = ctk.CTkFont(family="Segoe UI", size=32, weight="bold")
         self.font_subtitle = ctk.CTkFont(family="Segoe UI", size=15, weight="bold")
-        self.font_body = ctk.CTkFont(family="Segoe UI", size=13)
-        self.font_mono = ctk.CTkFont(family="Consolas", size=12)
+        self.font_body = ctk.CTkFont(family="Segoe UI", size=14)
+        self.font_mono = ctk.CTkFont(family="Consolas", size=13)
+        
+        self.theme_colors = {
+            "bg": "#121212",
+            "frame_bg": "#1e1e1e",
+            "border": "#2c2c2c",
+            "accent": "#4A90E2",
+            "accent_hover": "#357ABD",
+            "text_main": "#ffffff",
+            "text_dim": "#a0a0a0"
+        }
+        self.configure(fg_color=self.theme_colors["bg"])
 
         self.event_queue = queue.Queue()
         self.worker_thread = None
@@ -808,128 +820,135 @@ class EmisGuiApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
 
-        header = ctk.CTkFrame(self, corner_radius=16)
-        header.grid(row=0, column=0, padx=18, pady=(18, 10), sticky="ew")
+        header = ctk.CTkFrame(self, corner_radius=12, fg_color=self.theme_colors["frame_bg"], 
+                              border_width=1, border_color=self.theme_colors["border"])
+        header.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
         header.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        ctk.CTkLabel(header, text=APP_TITLE, font=self.font_title).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=16, pady=(14, 8)
+        ctk.CTkLabel(header, text=APP_TITLE, font=self.font_title, text_color=self.theme_colors["accent"]).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=20, pady=(16, 12)
         )
+        
+        entry_kwargs = {"corner_radius": 8, "height": 38, "border_width": 1, 
+                        "fg_color": "#181818", "border_color": self.theme_colors["border"]}
 
-        ctk.CTkLabel(header, text="Login", font=self.font_body).grid(row=1, column=0, sticky="w", padx=16)
-        self.login_entry = ctk.CTkEntry(header, placeholder_text="EMIS login", corner_radius=10, height=36)
+        ctk.CTkLabel(header, text="Login", font=self.font_body, text_color=self.theme_colors["text_dim"]).grid(row=1, column=0, sticky="w", padx=20)
+        self.login_entry = ctk.CTkEntry(header, placeholder_text="EMIS login", **entry_kwargs)
         login_val = self.app_config.get("login", "")
         if not login_val:
             login_val = os.environ.get("email", "")
         self.login_entry.insert(0, login_val)
-        self.login_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 12))
+        self.login_entry.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 16))
 
-        ctk.CTkLabel(header, text="Password", font=self.font_body).grid(row=1, column=1, sticky="w", padx=16)
+        ctk.CTkLabel(header, text="Password", font=self.font_body, text_color=self.theme_colors["text_dim"]).grid(row=1, column=1, sticky="w", padx=20)
         self.password_entry = ctk.CTkEntry(
             header,
             placeholder_text="EMIS password",
             show="*",
-            corner_radius=10,
-            height=36,
+            **entry_kwargs
         )
         pwd_val = self.app_config.get("password", "")
         if not pwd_val:
             pwd_val = os.environ.get("password", "")
         self.password_entry.insert(0, pwd_val)
-        self.password_entry.grid(row=2, column=1, sticky="ew", padx=16, pady=(4, 12))
+        self.password_entry.grid(row=2, column=1, sticky="ew", padx=20, pady=(4, 16))
 
-        ctk.CTkLabel(header, text="Browser", font=self.font_body).grid(row=1, column=2, sticky="w", padx=16)
+        ctk.CTkLabel(header, text="Browser", font=self.font_body, text_color=self.theme_colors["text_dim"]).grid(row=1, column=2, sticky="w", padx=20)
         self.browser_menu = ctk.CTkOptionMenu(
             header,
             values=["edge", "chrome", "brave"],
-            corner_radius=10,
-            height=36,
+            corner_radius=8,
+            height=38,
+            fg_color="#181818",
+            button_color=self.theme_colors["frame_bg"],
+            button_hover_color=self.theme_colors["border"]
         )
         self.browser_menu.set(self.detected_browser)
-        self.browser_menu.grid(row=2, column=2, sticky="ew", padx=16, pady=(4, 12))
+        self.browser_menu.grid(row=2, column=2, sticky="ew", padx=20, pady=(4, 16))
 
-        ctk.CTkLabel(header, text="Output base name", font=self.font_body).grid(row=1, column=3, sticky="w", padx=16)
-        self.output_entry = ctk.CTkEntry(header, corner_radius=10, height=36)
+        ctk.CTkLabel(header, text="Output base name", font=self.font_body, text_color=self.theme_colors["text_dim"]).grid(row=1, column=3, sticky="w", padx=20)
+        self.output_entry = ctk.CTkEntry(header, **entry_kwargs)
         self.output_entry.insert(0, str(Path.cwd() / "Emis_Report"))
-        self.output_entry.grid(row=2, column=3, sticky="ew", padx=16, pady=(4, 12))
+        self.output_entry.grid(row=2, column=3, sticky="ew", padx=20, pady=(4, 16))
 
-        status = ctk.CTkFrame(self, corner_radius=16)
-        status.grid(row=1, column=0, padx=18, pady=(0, 10), sticky="ew")
+        status = ctk.CTkFrame(self, corner_radius=12, fg_color=self.theme_colors["frame_bg"], 
+                              border_width=1, border_color=self.theme_colors["border"])
+        status.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
         status.grid_columnconfigure(0, weight=1)
 
-        self.status_label = ctk.CTkLabel(status, text="Ready", font=self.font_subtitle, anchor="w")
-        self.status_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
+        self.status_label = ctk.CTkLabel(status, text="Ready", font=self.font_subtitle, text_color=self.theme_colors["accent"], anchor="w")
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=20, pady=(12, 6))
 
-        self.progress_bar = ctk.CTkProgressBar(status, corner_radius=10)
+        self.progress_bar = ctk.CTkProgressBar(status, corner_radius=10, height=8, progress_color=self.theme_colors["accent"])
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
+        self.progress_bar.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 14))
 
-        actions = ctk.CTkFrame(self, corner_radius=16)
-        actions.grid(row=2, column=0, padx=18, pady=(0, 10), sticky="ew")
+        actions = ctk.CTkFrame(self, corner_radius=12, fg_color="transparent")
+        actions.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
         actions.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        btn_kwargs = {"height": 42, "corner_radius": 8, "font": self.font_subtitle}
 
         self.start_btn = ctk.CTkButton(
             actions,
             text="Start Parsing",
             command=self.start_parsing,
-            height=38,
-            corner_radius=12,
-            font=self.font_subtitle,
+            fg_color=self.theme_colors["accent"],
+            hover_color=self.theme_colors["accent_hover"],
+            **btn_kwargs
         )
-        self.start_btn.grid(row=0, column=0, padx=10, pady=12, sticky="ew")
+        self.start_btn.grid(row=0, column=0, padx=10, pady=4, sticky="ew")
 
         self.stop_btn = ctk.CTkButton(
             actions,
             text="Stop",
             command=self.stop_parsing,
             state="disabled",
-            height=38,
-            corner_radius=12,
             fg_color="#8b1d3a",
             hover_color="#a51f45",
-            font=self.font_subtitle,
+            **btn_kwargs
         )
-        self.stop_btn.grid(row=0, column=1, padx=10, pady=12, sticky="ew")
+        self.stop_btn.grid(row=0, column=1, padx=10, pady=4, sticky="ew")
 
         self.export_excel_btn = ctk.CTkButton(
             actions,
             text="Export to Excel",
             command=self.export_excel,
             state="disabled",
-            height=38,
-            corner_radius=12,
-            font=self.font_subtitle,
+            fg_color="#1F618D",
+            hover_color="#1A5276",
+            **btn_kwargs
         )
-        self.export_excel_btn.grid(row=0, column=2, padx=10, pady=12, sticky="ew")
+        self.export_excel_btn.grid(row=0, column=2, padx=10, pady=4, sticky="ew")
 
         self.export_pdf_btn = ctk.CTkButton(
             actions,
             text="Export to PDF",
             command=self.export_pdf,
             state="disabled",
-            height=38,
-            corner_radius=12,
-            font=self.font_subtitle,
+            fg_color="#1F618D",
+            hover_color="#1A5276",
+            **btn_kwargs
         )
-        self.export_pdf_btn.grid(row=0, column=3, padx=10, pady=12, sticky="ew")
+        self.export_pdf_btn.grid(row=0, column=3, padx=10, pady=4, sticky="ew")
 
-        content = ctk.CTkFrame(self, corner_radius=16)
-        content.grid(row=3, column=0, padx=18, pady=(0, 18), sticky="nsew")
+        content = ctk.CTkFrame(self, corner_radius=12, fg_color="transparent")
+        content.grid(row=3, column=0, padx=20, pady=(0, 20), sticky="nsew")
         content.grid_columnconfigure((0, 1), weight=1)
         content.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(content, text="Live Logs", font=self.font_subtitle).grid(
+        ctk.CTkLabel(content, text="Live Logs", font=self.font_subtitle, text_color=self.theme_colors["text_dim"]).grid(
             row=0, column=0, sticky="w", padx=14, pady=(12, 6)
         )
-        ctk.CTkLabel(content, text="Dashboard / Results", font=self.font_subtitle).grid(
+        ctk.CTkLabel(content, text="Dashboard / Results", font=self.font_subtitle, text_color=self.theme_colors["text_dim"]).grid(
             row=0, column=1, sticky="w", padx=14, pady=(12, 6)
         )
 
-        self.log_box = ctk.CTkTextbox(content, corner_radius=10, font=self.font_mono)
-        self.log_box.grid(row=1, column=0, sticky="nsew", padx=(14, 8), pady=(0, 14))
+        self.log_box = ctk.CTkTextbox(content, corner_radius=8, font=self.font_mono, fg_color="#181818", border_width=1, border_color=self.theme_colors["border"])
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=(0, 10), pady=0)
 
-        right = ctk.CTkFrame(content, corner_radius=10)
-        right.grid(row=1, column=1, sticky="nsew", padx=(8, 14), pady=(0, 14))
+        right = ctk.CTkFrame(content, corner_radius=12, fg_color=self.theme_colors["frame_bg"], border_width=1, border_color=self.theme_colors["border"])
+        right.grid(row=1, column=1, sticky="nsew", padx=(10, 0), pady=0)
         right.grid_rowconfigure(2, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
@@ -939,11 +958,24 @@ class EmisGuiApp(ctk.CTk):
             justify="left",
             anchor="w",
             font=self.font_body,
+            text_color=self.theme_colors["accent"]
         )
-        self.summary_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        self.summary_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
 
-        self.tabview = ctk.CTkTabview(right, corner_radius=10)
-        self.tabview.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.view_mode_var = ctk.StringVar(value="GUI")
+        self.view_mode_switch = ctk.CTkSegmentedButton(
+            right, 
+            values=["GUI", "Terminal"], 
+            variable=self.view_mode_var,
+            command=self._toggle_view_mode,
+            font=self.font_subtitle,
+            selected_color=self.theme_colors["accent"],
+            selected_hover_color=self.theme_colors["accent_hover"]
+        )
+        self.view_mode_switch.grid(row=1, column=0, pady=(0, 10), padx=16, sticky="ew")
+
+        self.tabview = ctk.CTkTabview(right, corner_radius=8, fg_color="#181818")
+        self.tabview.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
 
         self.tab_sem1 = self.tabview.add("Sem_1")
         self.tab_sem2 = self.tabview.add("Sem_2")
@@ -965,7 +997,32 @@ class EmisGuiApp(ctk.CTk):
         self.year_box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         self.raw_box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
+        self.gui_frames = {}
+        for tab, name in [(self.tab_sem1, "sem1"), (self.tab_sem2, "sem2"), (self.tab_year, "year")]:
+            scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+            scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+            self.gui_frames[name] = scroll
+
+        self._toggle_view_mode("GUI")
         self._build_target_tab()
+
+    def _toggle_view_mode(self, value):
+        show_terminal = (value == "Terminal")
+        
+        # Toggle visibilities
+        boxes = [self.sem1_box, self.sem2_box, self.year_box]
+        frames = [self.gui_frames["sem1"], self.gui_frames["sem2"], self.gui_frames["year"]]
+        
+        if show_terminal:
+            for box in boxes: box.tkraise()
+            for frame in frames: frame.grid_remove()
+            self.sem1_box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+            self.sem2_box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+            self.year_box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        else:
+            for frame in frames: frame.tkraise()
+            for box in boxes: box.grid_remove()
+            for frame in frames: frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
     def _build_target_tab(self):
         self.tab_target.grid_columnconfigure(0, weight=1)
@@ -1185,6 +1242,55 @@ class EmisGuiApp(ctk.CTk):
         lines.append(f"{title} FINAL SCORE (sum(Final)/14): {total_score:.2f}")
         return "\n".join(lines)
 
+    def _render_gui_table(self, frame_key: str, df: pd.DataFrame):
+        frame = self.gui_frames[frame_key]
+        for widget in frame.winfo_children():
+            widget.destroy()
+            
+        if df.empty:
+            ctk.CTkLabel(frame, text="No Data Available", font=self.font_subtitle, text_color=self.theme_colors["text_dim"]).grid(row=0, column=0, pady=20)
+            return
+
+        frame.grid_columnconfigure(0, weight=1)
+        for i in range(1, 5):
+            frame.grid_columnconfigure(i, weight=0, minsize=80)
+
+        headers = ["Subject", "Count", "Average", "Final", "Absences"]
+        
+        # Header Row
+        for col, hd in enumerate(headers):
+            anchor = "w" if col == 0 else ""
+            ctk.CTkLabel(frame, text=hd, font=self.font_subtitle, text_color=self.theme_colors["accent"]).grid(
+                row=0, column=col, sticky=anchor, padx=10, pady=(5, 10)
+            )
+            
+        # Header Separator
+        sep = ctk.CTkFrame(frame, height=2, fg_color=self.theme_colors["accent"])
+        sep.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 5), padx=5)
+
+        # Content Rows
+        for row_idx, (subject, row) in enumerate(df.iterrows(), start=2):
+            vals = [
+                str(subject), 
+                str(int(row.get("Count", 0))), 
+                f"{row.get('Average', 0):.2f}", 
+                str(int(row.get("Final", 0))), 
+                str(int(row.get("Absences", 0)))
+            ]
+            
+            for col, val in enumerate(vals):
+                font = self.font_subtitle if col == 0 else self.font_body
+                color = self.theme_colors["text_main"] if col == 0 else self.theme_colors["text_dim"]
+                anchor = "w" if col == 0 else ""
+                
+                ctk.CTkLabel(frame, text=val, font=font, text_color=color).grid(
+                    row=row_idx * 2, column=col, sticky=anchor, padx=10, pady=4
+                )
+            
+            # Row Separator
+            row_sep = ctk.CTkFrame(frame, height=1, fg_color=self.theme_colors["border"])
+            row_sep.grid(row=row_idx * 2 + 1, column=0, columnspan=5, sticky="ew", pady=2, padx=10)
+
     def _render_results(self, bundle):
         self.summary_label.configure(
             text=(
@@ -1205,6 +1311,11 @@ class EmisGuiApp(ctk.CTk):
             bundle["year_abs"],
             bundle["year_score"],
         )
+
+        # Render Modern UI tables
+        self._render_gui_table("sem1", bundle["sem1_df"])
+        self._render_gui_table("sem2", bundle["sem2_df"])
+        self._render_gui_table("year", bundle["year_df"])
 
         raw_df = bundle["raw"]
         raw_text = "=== RAW ===\n"
